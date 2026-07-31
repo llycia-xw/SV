@@ -806,3 +806,153 @@ echo "  7. ${OUTDIR}/snp_sharing_concordance.pdf        - Visualization plot"
 echo "  8. ${OUTDIR}/snp_stats.tsv                      - Statistics table"
 echo "=========================================="
 ```
+
+**This step re-classifies each SNP by the number of sample pairs in which it had a genotype comparison (concordant or discordant), rather than only counting concordant comparisons as "present," which had previously caused mean concordance to be artificially inflated near 100%. Genotype concordance is now calculated independently for each site, so the resulting bar chart and concordance line reflect true, unbiased patterns of SNP sharing and agreement across sample pairs.
+
+```
+#!/usr/bin/env python3
+"""
+SNP Matrix Analysis Script (Fixed Version)
+===========================================
+For each SNP site, count how many sample pairs it was COMPARED IN
+(regardless of whether the comparison was concordant or discordant),
+and separately compute genotype concordance for that site.
+
+Fix from the previous version:
+Previously, "presence" was defined as value == 0, meaning only
+concordant comparisons were counted as "present". Since sites were
+then grouped by that same count, every group ended up almost entirely
+concordant by construction, making mean concordance ~100% regardless
+of the underlying data (a circular result).
+
+Here, "presence" is defined as value is not NA, i.e. the site had a
+comparison result in that sample pair (concordant=0 or discordant=1).
+Concordance is computed independently of this presence count.
+
+Input : site_level_concordance_matrix.tsv
+        (wide table; rows = SNP sites, columns = sample pairs,
+         values = 0/1/NA)
+Output: snp_stats_fixed.tsv                (summary table)
+        snp_sharing_concordance_fixed.pdf  (bar + line chart)
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import sys
+import os
+
+# -------------------------------------------------
+# 1. Load input matrix
+# -------------------------------------------------
+input_file = sys.argv[1] if len(sys.argv) > 1 else "concordance-analysis/site_level_concordance_matrix.tsv"
+
+if not os.path.exists(input_file):
+    print(f"[ERROR] File not found: {input_file}")
+    print("Usage: python analyze_snp_matrix_fixed.py site_level_concordance_matrix.tsv")
+    sys.exit(1)
+
+output_dir = os.path.dirname(os.path.abspath(input_file))
+output_stats = os.path.join(output_dir, "snp_stats_fixed.tsv")
+output_figure = os.path.join(output_dir, "snp_sharing_concordance_fixed.pdf")
+
+df = pd.read_csv(input_file, sep="\t", low_memory=False)
+total_sites = df.shape[0]
+print(f"[INFO] Loaded {total_sites:,} SNP sites, {df.shape[1]} columns")
+
+# -------------------------------------------------
+# 2. Split metadata columns from sample-pair columns
+# -------------------------------------------------
+meta_cols = ["CHROM", "POS", "REF", "ALT"]
+sample_cols = [c for c in df.columns if c not in meta_cols]
+n_pairs = len(sample_cols)
+
+sample_df = df[sample_cols].apply(pd.to_numeric, errors="coerce")
+
+# -------------------------------------------------
+# 3. Presence = compared in this sample pair (value is 0 or 1, not NA)
+# -------------------------------------------------
+presence = ~sample_df.isna()
+df["n_samples_present"] = presence.sum(axis=1)
+
+# -------------------------------------------------
+# 4. Concordance = fraction of concordant (0) calls among comparisons
+# -------------------------------------------------
+def calc_concordance(row):
+    vals = row.dropna()
+    if len(vals) == 0:
+        return np.nan
+    return (vals == 0).sum() / len(vals)
+
+df["concordance"] = sample_df.apply(calc_concordance, axis=1)
+
+# -------------------------------------------------
+# 5. Group sites by number of sample pairs they were compared in
+# -------------------------------------------------
+stats = []
+for k in range(1, n_pairs + 1):
+    subset = df[df["n_samples_present"] == k]
+    mean_conc = subset["concordance"].mean()
+    stats.append({
+        "n_sample_pairs": k,
+        "n_snps": len(subset),
+        "mean_concordance": round(mean_conc, 4) if not np.isnan(mean_conc) else np.nan
+    })
+stats_df = pd.DataFrame(stats)
+
+# Sanity check: total SNPs across bars should equal total rows in the matrix
+bar_total = stats_df["n_snps"].sum()
+print(f"[CHECK] Sum across bars = {bar_total:,} | Matrix rows = {total_sites:,} | "
+      f"{'OK' if bar_total == total_sites else 'MISMATCH'}")
+
+stats_df.to_csv(output_stats, sep="\t", index=False)
+print(f"[INFO] Summary table saved: {output_stats}")
+
+# -------------------------------------------------
+# 6. Plot: SNP count (bars) + mean concordance (line)
+# -------------------------------------------------
+fig, ax1 = plt.subplots(figsize=(14, 6))
+x = stats_df["n_sample_pairs"].values
+y_snps = stats_df["n_snps"].values
+y_conc = stats_df["mean_concordance"].values
+
+colors = plt.cm.Blues(np.linspace(0.35, 0.85, len(x)))
+bars = ax1.bar(x, y_snps, color=colors, edgecolor="white", linewidth=0.6, zorder=2, label="SNP count")
+ax1.set_xlabel("Number of Sample Pairs Where SNP Was Compared", fontsize=13)
+ax1.set_ylabel("Number of SNPs", fontsize=13, color="#2166ac")
+ax1.tick_params(axis="y", labelcolor="#2166ac")
+ax1.set_xticks(x)
+ax1.set_xticklabels([str(i) for i in x], fontsize=10)
+ax1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{int(v):,}"))
+ax1.set_xlim(0.3, n_pairs + 0.7)
+ax1.yaxis.grid(True, linestyle="--", alpha=0.4, zorder=0)
+ax1.set_axisbelow(True)
+
+for bar, val in zip(bars, y_snps):
+    if val > 0:
+        ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(y_snps) * 0.01,
+                  f"{val:,}", ha="center", va="bottom", fontsize=7.5, color="#2166ac", fontweight="bold")
+
+ax2 = ax1.twinx()
+valid = ~np.isnan(y_conc)
+ax2.plot(x[valid], y_conc[valid] * 100, color="#d6604d", marker="o", markersize=5,
+          linewidth=2, label="Mean concordance", zorder=3)
+ax2.set_ylabel("Mean Concordance (%)", fontsize=13, color="#d6604d")
+ax2.tick_params(axis="y", labelcolor="#d6604d")
+ax2.set_ylim(0, 110)
+ax2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=10, framealpha=0.85)
+
+plt.title("SNP Sharing Across Sample Pairs and Genotype Concordance (Fixed)",
+          fontsize=14, fontweight="bold", pad=12)
+plt.tight_layout()
+plt.savefig(output_figure, bbox_inches="tight")
+plt.close()
+print(f"[INFO] Figure saved: {output_figure}")
+```
